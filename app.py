@@ -1,12 +1,5 @@
-import re
-import yaml
-from typing import Final
-
-from dotenv import load_dotenv
-from state import MultiAgentState
-from langgraph.graph import StateGraph, END
 from agents import (
-    supervisor_node,
+    AgentHandoff,
     orders_agent_node,
     billing_agent_node,
     technical_agent_node,
@@ -14,9 +7,40 @@ from agents import (
     general_agent_node,
     synthesize_response_node,
 )
-from audit import SessionAuditLog, persist_audit_log
+from typing import TypedDict
+import yaml
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from typing import Literal
+from langgraph.graph import StateGraph, END
+import re
+from typing import Final
+from dotenv import load_dotenv
+from langgraph.graph import StateGraph, END
 
+from audit import SessionAuditLog, persist_audit_log
+from datetime import datetime
+from agents import AgentHandoff
 load_dotenv()
+
+from typing import TypedDict
+
+class MultiAgentState(TypedDict):
+    user_request: str        # original user message
+    route: str               # "orders" | "billing" | "technical" | "subscription" | "general"
+    agent_used: str          # which specialist handled it
+    specialist_result: str   # raw output from specialist agent
+    final_response: str      # final response returned to the user
+    handoff_context: str
+
+with open("prompts/supervisor_v1.yaml", "r", encoding="utf-8") as f:
+    prompt_data = yaml.safe_load(f)
+
+supervisor_system_prompt_from_yaml = prompt_data["system"]
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+VALID_ROUTES = {"orders", "billing", "technical", "subscription", "general"}
 
 INJECTION_PATTERNS: Final[list[str]] = [
     r"ignore (your |all |previous )?instructions",
@@ -26,18 +50,16 @@ INJECTION_PATTERNS: Final[list[str]] = [
     r"jailbreak",
 ]
 
-def detect_injection(user_input: str) -> bool:
-    text = user_input.lower()
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, text):
-            return True
-    return False
-
-def guard_request(user_input: str) -> str:
-    if detect_injection(user_input):
-        return "I can only assist with account and order support. (Request blocked.)"
-    return user_input
-
+def supervisor_node(state: MultiAgentState) -> dict:
+    messages = [
+        SystemMessage(content=supervisor_system_prompt_from_yaml),
+        HumanMessage(content=state["user_request"]),
+    ]
+    response = llm.invoke(messages)
+    route = response.content.strip().lower()
+    if route not in VALID_ROUTES:
+        route = "general"
+    return {"route": route}
 
 def route_to_specialist(state: MultiAgentState) -> str:
     route_map: dict[str, str] = {
@@ -65,13 +87,6 @@ def build_graph():
     workflow.add_conditional_edges(
         "supervisor_node",
         route_to_specialist,
-        {
-            "orders_agent_node": "orders_agent_node",
-            "billing_agent_node": "billing_agent_node",
-            "technical_agent_node": "technical_agent_node",
-            "subscription_agent_node": "subscription_agent_node",
-            "general_agent_node": "general_agent_node",
-        },
     )
 
     for specialist in [
@@ -87,7 +102,17 @@ def build_graph():
 
     return workflow.compile()
 
+def detect_injection(user_input: str) -> bool:
+    text = user_input.lower()
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, text):
+            return True
+    return False
 
+def guard_request(user_input: str) -> str:
+    if detect_injection(user_input):
+        return "I can only assist with account and order support. (Request blocked.)"
+    return user_input
 
 def main() -> None:
     audit = SessionAuditLog(session_id="demo-session")
